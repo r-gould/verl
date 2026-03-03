@@ -1167,7 +1167,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None,
+                        lora_only=False):
         from verl.utils.logger import log_with_rank
 
         # only support save and load ckpt for actor
@@ -1176,10 +1177,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        self.checkpoint_manager.save_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
-        )
-        dist.barrier()
+        # When lora_only=True and LoRA is active, skip saving full model/optimizer shards
+        # (only save the lightweight LoRA adapter below). This drastically reduces storage.
+        if lora_only and self._is_lora:
+            # Ensure the checkpoint directory exists even when skipping full shard saves
+            os.makedirs(local_path, exist_ok=True)
+            dist.barrier()
+        else:
+            self.checkpoint_manager.save_checkpoint(
+                local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+            )
+            dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
             lora_save_path = os.path.join(local_path, "lora_adapter")

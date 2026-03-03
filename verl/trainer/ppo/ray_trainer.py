@@ -387,8 +387,13 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path,
+                          extra_fields=None):
+        """Dump rollout/validation samples as JSONL.
+
+        Args:
+            extra_fields: optional dict of {field_name: list_of_values} to include per sample.
+        """
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
 
@@ -405,6 +410,11 @@ class RayPPOTrainer:
             if len(v) == n:
                 base_data[k] = v
 
+        if extra_fields:
+            for k, v in extra_fields.items():
+                if len(v) == n:
+                    base_data[k] = v
+
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
@@ -416,14 +426,21 @@ class RayPPOTrainer:
         print(f"Dumped generations to {filename}")
 
     def _log_rollout_data(
-        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str,
+        training_metrics: dict = None,
     ):
         """Log rollout data to disk.
+
+        Saves per-sample JSONL with enriched fields for downstream attribution analysis:
+        token IDs, advantages, prompt/response lengths, rewards, and learning rate.
+
         Args:
             batch (DataProto): The batch containing rollout data
             reward_extra_infos_dict (dict): Additional reward information to log
             timing_raw (dict): Timing information for profiling
             rollout_data_dir (str): Directory path to save the rollout data
+            training_metrics (dict, optional): Metrics dict from the current training step,
+                used to extract the actual (possibly annealed) learning rate.
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
@@ -438,6 +455,58 @@ class RayPPOTrainer:
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
 
+            # --- Enriched fields for attribution analysis ---
+            n = len(inputs)
+            extra_fields = {}
+
+            # Token IDs (prompt and response as lists of ints)
+            prompt_ids = batch.batch["prompts"].cpu()
+            response_ids = batch.batch["responses"].cpu()
+            attention_mask = batch.batch["attention_mask"].cpu()
+
+            # Prompt lengths: count non-padding tokens in the prompt portion
+            response_length = response_ids.shape[1]
+            prompt_attention = attention_mask[:, :-response_length] if attention_mask.shape[1] > response_length else attention_mask
+            prompt_lengths = prompt_attention.sum(dim=1).tolist()
+
+            # Response lengths: count non-padding tokens in the response portion
+            response_mask = batch.batch.get("response_mask", None)
+            if response_mask is not None:
+                response_lengths = response_mask.cpu().sum(dim=1).tolist()
+            else:
+                response_attention = attention_mask[:, -response_length:]
+                response_lengths = response_attention.sum(dim=1).tolist()
+
+            extra_fields["prompt_ids"] = [ids.tolist() for ids in prompt_ids]
+            extra_fields["response_ids"] = [ids.tolist() for ids in response_ids]
+            extra_fields["prompt_length"] = [int(x) for x in prompt_lengths]
+            extra_fields["response_length"] = [int(x) for x in response_lengths]
+            extra_fields["total_response_tokens"] = [int(sum(response_lengths))] * n
+
+            # Advantages (outcome-level, summed over tokens)
+            if "advantages" in batch.batch:
+                adv = batch.batch["advantages"].cpu()
+                if adv.dim() == 2:
+                    # Token-level advantages → sum to get outcome-level
+                    extra_fields["advantages"] = adv.sum(dim=1).tolist()
+                else:
+                    extra_fields["advantages"] = adv.tolist()
+
+            # Rewards (token-level scores summed = outcome reward, same as 'score')
+            extra_fields["rewards"] = scores
+
+            # Learning rate (actual current LR, accounting for annealing/warmup)
+            lr = None
+            if training_metrics and "actor/lr" in training_metrics:
+                lr = float(training_metrics["actor/lr"])
+            else:
+                # Fallback to static config value if metrics not available
+                try:
+                    lr = float(self.config.actor_rollout_ref.actor.optim.lr)
+                except Exception:
+                    pass
+            extra_fields["learning_rate"] = [lr] * n
+
             self._dump_generations(
                 inputs=inputs,
                 outputs=outputs,
@@ -445,6 +514,7 @@ class RayPPOTrainer:
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
+                extra_fields=extra_fields,
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
@@ -878,8 +948,12 @@ class RayPPOTrainer:
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
 
+        # When lora_only_checkpoint is enabled, only save LoRA adapter weights (not full model shards).
+        lora_only = self.config.trainer.get("lora_only_checkpoint", False)
+
         self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep,
+            lora_only=lora_only,
         )
 
         if self.use_critic:
@@ -1258,6 +1332,32 @@ class RayPPOTrainer:
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
             rollout_skip.wrap_generate_sequences()
 
+        # Warn about checkpoint storage when not using LoRA
+        if self.config.trainer.save_freq > 0:
+            lora_rank = self.config.actor_rollout_ref.model.get("lora_rank", 0) or 0
+            lora_only_ckpt = self.config.trainer.get("lora_only_checkpoint", False)
+            if lora_rank == 0:
+                print(
+                    "\n" + "=" * 70 + "\n"
+                    "WARNING: Checkpointing is enabled (save_freq > 0) but LoRA is NOT being used.\n"
+                    "Full model weights will be saved at each checkpoint, which can be very storage-intensive.\n"
+                    "Consider using LoRA (actor_rollout_ref.model.lora_rank > 0) to reduce checkpoint size.\n"
+                    + "=" * 70 + "\n"
+                )
+            elif lora_only_ckpt:
+                print("Checkpoint mode: LoRA-only (skipping full model shards)")
+            else:
+                print(
+                    "Note: LoRA is active but full model shards are also being saved. "
+                    "Set trainer.lora_only_checkpoint=True to save only LoRA adapters."
+                )
+
+        # Save initial checkpoint (step 0 = before any updates) for attribution analysis
+        if self.config.trainer.save_freq > 0:
+            print("Saving initial checkpoint (global_step_0) before training begins...")
+            with marked_timer("save_initial_checkpoint", {}, color="green"):
+                self._save_checkpoint()
+
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -1529,7 +1629,8 @@ class RayPPOTrainer:
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir,
+                                               training_metrics=metrics)
 
                 # validate
                 if self.config.trainer.test_freq > 0 and (
