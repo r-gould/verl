@@ -544,6 +544,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         torch.distributed.barrier()
 
+        # Save original parameter names before FSDP wrapping.
+        # Needed to map FSDP.full_optim_state_dict() integer keys back to
+        # individual parameter names when saving optimizer_v.pt.
+        if role == "actor":
+            self._orig_param_names = [name for name, _ in actor_module.named_parameters()]
+
         if self.rank == 0:
             print_model_size(actor_module)
 
@@ -1222,46 +1228,80 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # Save optimizer second moments (exp_avg_sq) for LoRA params.
             # Needed by the attribution pipeline for AdamW support.
+            # With FSDP (use_orig_params=False), optimizer state is sharded
+            # across ranks.  Use FSDP.full_optim_state_dict() — a collective
+            # that gathers the full (unsharded) state to rank 0.
             try:
-                if isinstance(self.actor_module_fsdp, FSDP):
-                    # FSDP: gather full optimizer state (collective op, all ranks).
-                    # Returns dict with 'state' mapping FQN -> {exp_avg, exp_avg_sq, ...}
-                    full_optim = FSDP.optim_state_dict(
+                import gc as _gc
+                v_dict = {}
+                if fsdp_version(self.actor_module_fsdp) > 0:
+                    # Collective: all ranks must call.  Returns full
+                    # (unsharded, individual-parameter) state on rank 0,
+                    # empty dict on other ranks.
+                    full_osd = FSDP.full_optim_state_dict(
                         self.actor_module_fsdp, self.actor_optimizer
                     )
-                    if dist.get_rank() == 0 and full_optim:
-                        v_dict = {}
-                        state_entries = full_optim.get("state", {})
-                        for fqn, state in state_entries.items():
-                            if isinstance(state, dict) and "exp_avg_sq" in state:
-                                # Use the FQN as key (same format as adapter_model.safetensors keys)
-                                v_dict[str(fqn)] = state["exp_avg_sq"].detach().cpu()
-                        if v_dict:
-                            torch.save(v_dict, os.path.join(lora_save_path, "optimizer_v.pt"))
+                    if dist.get_rank() == 0 and full_osd:
+                        state = full_osd.get("state", {})
+                        # Map integer keys → original parameter names.
+                        # _orig_param_names was saved before FSDP wrapping.
+                        orig_names = getattr(self, "_orig_param_names", [])
+                        if not orig_names:
                             log_with_rank(
-                                f"Saved optimizer_v.pt ({len(v_dict)} entries)",
+                                "Warning: _orig_param_names not set; "
+                                "cannot map optimizer state to param names",
                                 rank=0, logger=logger, log_only_rank_0=True,
                             )
+                        for key, param_state in state.items():
+                            if "exp_avg_sq" not in param_state:
+                                continue
+                            # Handle both integer keys (use_orig_params=False)
+                            # and FQN string keys (use_orig_params=True).
+                            if isinstance(key, str):
+                                name = key
+                            elif isinstance(key, int) and key < len(orig_names):
+                                name = orig_names[key]
+                            else:
+                                continue
+                            if "lora_" in name:
+                                v = param_state["exp_avg_sq"]
+                                if hasattr(v, "full_tensor"):
+                                    v = v.full_tensor()
+                                v_dict[name] = v.detach().cpu()
+                        del full_osd, state
+                        _gc.collect()
+                        torch.cuda.empty_cache()
                 else:
-                    # Non-FSDP: directly access optimizer state by parameter object
-                    if dist.get_rank() == 0:
-                        v_dict = {}
-                        for name, param in peft_model.named_parameters():
-                            if "lora_" in name and param.requires_grad:
-                                if param in self.actor_optimizer.state:
-                                    state = self.actor_optimizer.state[param]
-                                    if "exp_avg_sq" in state:
-                                        v_dict[name] = state["exp_avg_sq"].detach().cpu()
-                        if v_dict:
-                            torch.save(v_dict, os.path.join(lora_save_path, "optimizer_v.pt"))
-                            log_with_rank(
-                                f"Saved optimizer_v.pt ({len(v_dict)} entries)",
-                                rank=0, logger=logger, log_only_rank_0=True,
-                            )
+                    # No FSDP: direct access works.
+                    for name, param in peft_model.named_parameters():
+                        if "lora_" in name and param.requires_grad:
+                            if param in self.actor_optimizer.state:
+                                st = self.actor_optimizer.state[param]
+                                if "exp_avg_sq" in st:
+                                    v_dict[name] = st["exp_avg_sq"].detach().cpu()
+
+                if dist.get_rank() == 0:
+                    if v_dict:
+                        torch.save(v_dict, os.path.join(lora_save_path, "optimizer_v.pt"))
+                        total_elems = sum(v.numel() for v in v_dict.values())
+                        sample = list(v_dict.items())[:2]
+                        log_with_rank(
+                            f"Saved optimizer_v.pt ({len(v_dict)} params, "
+                            f"{total_elems} total elements, "
+                            f"sample: {[(n, tuple(v.shape)) for n, v in sample]})",
+                            rank=0, logger=logger, log_only_rank_0=True,
+                        )
+                    else:
+                        log_with_rank(
+                            "optimizer_v.pt: no LoRA exp_avg_sq found",
+                            rank=0, logger=logger, log_only_rank_0=True,
+                        )
                 dist.barrier()
             except Exception as e:
+                import traceback
                 log_with_rank(
-                    f"Could not save optimizer_v.pt: {e}",
+                    f"Could not save optimizer_v.pt: {e}\n"
+                    f"{traceback.format_exc()}",
                     rank=dist.get_rank(), logger=logger, log_only_rank_0=True,
                 )
 
