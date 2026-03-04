@@ -1220,6 +1220,51 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 log_only_rank_0=True,
             )
 
+            # Save optimizer second moments (exp_avg_sq) for LoRA params.
+            # Needed by the attribution pipeline for AdamW support.
+            try:
+                if isinstance(self.actor_module_fsdp, FSDP):
+                    # FSDP: gather full optimizer state (collective op, all ranks).
+                    # Returns dict with 'state' mapping FQN -> {exp_avg, exp_avg_sq, ...}
+                    full_optim = FSDP.optim_state_dict(
+                        self.actor_module_fsdp, self.actor_optimizer
+                    )
+                    if dist.get_rank() == 0 and full_optim:
+                        v_dict = {}
+                        state_entries = full_optim.get("state", {})
+                        for fqn, state in state_entries.items():
+                            if isinstance(state, dict) and "exp_avg_sq" in state:
+                                # Use the FQN as key (same format as adapter_model.safetensors keys)
+                                v_dict[str(fqn)] = state["exp_avg_sq"].detach().cpu()
+                        if v_dict:
+                            torch.save(v_dict, os.path.join(lora_save_path, "optimizer_v.pt"))
+                            log_with_rank(
+                                f"Saved optimizer_v.pt ({len(v_dict)} entries)",
+                                rank=0, logger=logger, log_only_rank_0=True,
+                            )
+                else:
+                    # Non-FSDP: directly access optimizer state by parameter object
+                    if dist.get_rank() == 0:
+                        v_dict = {}
+                        for name, param in peft_model.named_parameters():
+                            if "lora_" in name and param.requires_grad:
+                                if param in self.actor_optimizer.state:
+                                    state = self.actor_optimizer.state[param]
+                                    if "exp_avg_sq" in state:
+                                        v_dict[name] = state["exp_avg_sq"].detach().cpu()
+                        if v_dict:
+                            torch.save(v_dict, os.path.join(lora_save_path, "optimizer_v.pt"))
+                            log_with_rank(
+                                f"Saved optimizer_v.pt ({len(v_dict)} entries)",
+                                rank=0, logger=logger, log_only_rank_0=True,
+                            )
+                dist.barrier()
+            except Exception as e:
+                log_with_rank(
+                    f"Could not save optimizer_v.pt: {e}",
+                    rank=dist.get_rank(), logger=logger, log_only_rank_0=True,
+                )
+
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
