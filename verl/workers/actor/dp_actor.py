@@ -60,6 +60,7 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self._grad_proj_Q = None  # orthonormal basis for gradient projection
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -388,10 +389,67 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["sum_pi_squared"] = sum_pi_squared
             return outputs
 
+    def load_grad_projection(self, path: str):
+        """Load an orthonormal gradient projection basis from a .pt file.
+
+        The file should contain a dict with key 'Q': a tensor of shape
+        (d_total, n_directions) representing an orthonormal basis (columns)
+        for the subspace to project out of gradients.  The basis should
+        already be orthonormalized (e.g. via QR) by the script that
+        produced it.
+        """
+        import os
+        if not os.path.exists(path):
+            print(f"WARN: grad projection file not found: {path}")
+            self._grad_proj_Q = None
+            return
+
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        Q = data["Q"].float()  # (d_total, n_dirs)
+        if Q.dim() == 1:
+            Q = Q.unsqueeze(1)
+        self._grad_proj_Q = Q
+        self._grad_proj_device_Q = None  # lazy move to GPU
+        if torch.distributed.get_rank() == 0:
+            print(f"Loaded gradient projection basis: {Q.shape[1]} direction(s), "
+                  f"d_total={Q.shape[0]} from {path}")
+
+    def _project_gradients(self):
+        """Project out the harmful subspace from trainable parameter gradients.
+
+        Computes g_proj = g - Q @ (Q^T @ g) where Q is the orthonormal basis
+        loaded via load_grad_projection().
+        """
+        params_with_grad = [(p, p.grad) for p in self.actor_module.parameters()
+                           if p.requires_grad and p.grad is not None]
+        if not params_with_grad:
+            return
+
+        if self._grad_proj_device_Q is None:
+            device = params_with_grad[0][1].device
+            self._grad_proj_device_Q = self._grad_proj_Q.to(device)
+
+        Q = self._grad_proj_device_Q  # (d_total, n_dirs)
+
+        grad_flat = torch.cat([g.flatten() for _, g in params_with_grad])
+        coeffs = Q.T @ grad_flat.float()  # (n_dirs,)
+        correction = Q @ coeffs  # (d_total,)
+
+        offset = 0
+        for _, g in params_with_grad:
+            n = g.numel()
+            g.sub_(correction[offset:offset + n].view(g.shape).to(g.dtype))
+            offset += n
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
         if self.scaler is not None:
             self.scaler.unscale_(self.actor_optimizer)
+
+        # Project out harmful directions before clipping (if basis loaded)
+        if self._grad_proj_Q is not None:
+            self._project_gradients()
+
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):

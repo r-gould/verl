@@ -919,6 +919,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor = DataParallelPPOActor(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
+            # Load gradient projection basis if configured
+            grad_proj_path = self.config.actor.get("grad_projection_path", None)
+            if grad_proj_path:
+                self.actor.load_grad_projection(grad_proj_path)
 
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
