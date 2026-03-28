@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import sys
 
 import torch
 from torch import nn
@@ -400,9 +401,7 @@ class DataParallelPPOActor(BasePPOActor):
         """
         import os
         if not os.path.exists(path):
-            print(f"WARN: grad projection file not found: {path}")
-            self._grad_proj_Q = None
-            return
+            raise FileNotFoundError(f"Gradient projection file not found: {path}")
 
         data = torch.load(path, map_location="cpu", weights_only=True)
         Q = data["Q"].float()  # (d_total, n_dirs)
@@ -410,15 +409,82 @@ class DataParallelPPOActor(BasePPOActor):
             Q = Q.unsqueeze(1)
         self._grad_proj_Q = Q
         self._grad_proj_device_Q = None  # lazy move to GPU
+
+        # Verify parameter ordering matches between basis and model.
+        # FSDP wraps names with _fsdp_wrapped_module prefixes; strip them
+        # to get the canonical LoRA parameter names for comparison.
+        import re
+        def _normalize_param_name(name):
+            name = re.sub(r'_fsdp_wrapped_module\.', '', name)
+            name = re.sub(r'\._flat_param$', '', name)
+            name = re.sub(r'\.weight$', '', name)
+            return name
+
+        metadata = data.get("metadata", {})
+        basis_param_names = metadata.get("param_names", None)
+        if basis_param_names is None:
+            raise ValueError(
+                f"Projection basis at {path} is missing 'param_names' in metadata. "
+                f"Re-extract the basis with the latest extract_projection_basis.py "
+                f"to include parameter ordering information."
+            )
+        model_param_names_raw = [n for n, p in self.actor_module.named_parameters()
+                                 if p.requires_grad]
+        model_param_names = [_normalize_param_name(n) for n in model_param_names_raw]
+        basis_param_names_stripped = [_normalize_param_name(n) for n in basis_param_names]
+        if basis_param_names_stripped != model_param_names:
+            raise ValueError(
+                f"Parameter ordering mismatch between projection basis and model!\n"
+                f"  Basis params ({len(basis_param_names_stripped)}): {basis_param_names_stripped[:5]}...\n"
+                f"  Model params ({len(model_param_names)}): {model_param_names[:5]}...\n"
+                f"  This would silently apply the projection to wrong parameters."
+            )
+
+        # Handle FSDP sharding: Q was computed on the full (unsharded) model,
+        # but each FSDP worker only holds a shard of the parameters.
+        model_d_total = sum(p.numel() for p in self.actor_module.parameters()
+                            if p.requires_grad)
+        self._grad_proj_fsdp_sharded = False
+        if Q.shape[0] != model_d_total:
+            # Check if FSDP is sharding: full Q should be divisible by world_size
+            if torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                rank = torch.distributed.get_rank()
+                if Q.shape[0] == model_d_total * world_size:
+                    # Shard Q to match this worker's parameter shard
+                    shard_size = model_d_total
+                    Q = Q[rank * shard_size : (rank + 1) * shard_size]
+                    self._grad_proj_fsdp_sharded = True
+                    if rank == 0:
+                        print(f"  FSDP detected: sharded Q from {Q.shape[0] * world_size} "
+                              f"to {Q.shape[0]} for rank {rank}/{world_size}")
+                else:
+                    raise ValueError(
+                        f"Projection basis d_total ({self._grad_proj_Q.shape[0]}) does not match "
+                        f"model trainable params ({model_d_total}) or FSDP sharding "
+                        f"({model_d_total} * {world_size} = {model_d_total * world_size})."
+                    )
+            else:
+                raise ValueError(
+                    f"Projection basis d_total ({Q.shape[0]}) does not match "
+                    f"model trainable params ({model_d_total})."
+                )
+
+        self._grad_proj_Q = Q  # potentially sharded
         if torch.distributed.get_rank() == 0:
             print(f"Loaded gradient projection basis: {Q.shape[1]} direction(s), "
-                  f"d_total={Q.shape[0]} from {path}")
+                  f"d_total={Q.shape[0]} (local shard) from {path}",
+                  file=sys.stderr, flush=True)
 
     def _project_gradients(self):
         """Project out the harmful subspace from trainable parameter gradients.
 
         Computes g_proj = g - Q @ (Q^T @ g) where Q is the orthonormal basis
         loaded via load_grad_projection().
+
+        For FSDP: each worker computes local Q_shard^T @ g_shard, then
+        all-reduces the coefficients (k floats) before applying the local
+        correction. This is communication-minimal.
         """
         params_with_grad = [(p, p.grad) for p in self.actor_module.parameters()
                            if p.requires_grad and p.grad is not None]
@@ -429,11 +495,30 @@ class DataParallelPPOActor(BasePPOActor):
             device = params_with_grad[0][1].device
             self._grad_proj_device_Q = self._grad_proj_Q.to(device)
 
-        Q = self._grad_proj_device_Q  # (d_total, n_dirs)
+        Q = self._grad_proj_device_Q  # (d_local, n_dirs)
 
         grad_flat = torch.cat([g.flatten() for _, g in params_with_grad])
-        coeffs = Q.T @ grad_flat.float()  # (n_dirs,)
-        correction = Q @ coeffs  # (d_total,)
+        coeffs = Q.T @ grad_flat.float()  # (n_dirs,) — local contribution
+
+        # All-reduce coefficients across FSDP workers so each has the full Q^T @ g
+        if self._grad_proj_fsdp_sharded and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(coeffs, op=torch.distributed.ReduceOp.SUM)
+
+        correction = Q @ coeffs  # (d_local,)
+
+        # Log projection magnitude periodically (every 10 calls on rank 0)
+        if not hasattr(self, '_proj_call_count'):
+            self._proj_call_count = 0
+        self._proj_call_count += 1
+        if self._proj_call_count <= 3 or self._proj_call_count % 10 == 0:
+            grad_norm = grad_flat.float().norm().item()
+            correction_norm = correction.norm().item()
+            frac = correction_norm / max(grad_norm, 1e-12)
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                print(f"[GradProj step {self._proj_call_count}] "
+                      f"||grad||={grad_norm}, ||correction||={correction_norm}, "
+                      f"fraction removed={frac}, coeffs={coeffs.tolist()}",
+                      file=sys.stderr, flush=True)
 
         offset = 0
         for _, g in params_with_grad:

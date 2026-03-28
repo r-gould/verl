@@ -300,6 +300,7 @@ class FSDPActorConfig(ActorConfig):
     calculate_sum_pi_squared: bool = False
     sum_pi_squared_checkpointing: bool = False
     qat: QATConfig = field(default_factory=QATConfig)
+    grad_projection_path: str | None = None
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""
