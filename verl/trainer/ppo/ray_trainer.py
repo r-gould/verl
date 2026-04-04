@@ -991,6 +991,114 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _inject_ablation_rollouts(self, original_batch, ablation_cfg):
+        """Reconstruct a full training batch from a cached rollout JSONL file.
+
+        Used for event-level ablation: instead of generating fresh rollouts,
+        we inject the exact rollouts from a reference run so that zeroing one
+        event's advantage is a faithful counterfactual.
+
+        The JSONL stores already-padded data:
+        - prompt_ids: [max_prompt_length], left-padded with pad_token_id
+        - response_ids: [max_response_length], right-padded with pad_token_id
+        - prompt_length: number of non-pad prompt tokens
+        - response_length: number of non-pad response tokens (NOT string length)
+        - score: reward score (float)
+
+        The JSONL is in post-balance_batch order (as logged by veRL), so we
+        skip balance_batch for the ablation step.
+        """
+        import json as _json
+        rollout_jsonl = ablation_cfg.get("rollout_jsonl")
+        print(f"[ABLATION] Loading rollouts from {rollout_jsonl}", flush=True)
+
+        with open(rollout_jsonl) as f:
+            events = [_json.loads(line) for line in f]
+        n_events = len(events)
+
+        import torch
+        import numpy as np
+
+        # Data is already padded to max_prompt_length / max_response_length
+        prompt_ids = torch.tensor([e["prompt_ids"] for e in events], dtype=torch.long)
+        response_ids = torch.tensor([e["response_ids"] for e in events], dtype=torch.long)
+        input_ids = torch.cat([prompt_ids, response_ids], dim=1)
+
+        # Reconstruct masks from prompt_length and response_length fields,
+        # matching how veRL constructs them via tokenizer.pad().
+        prompt_length = self.config.data.max_prompt_length
+        resp_max = response_ids.shape[1]
+
+        # Prompt attention: 1 for the last prompt_len tokens, 0 for left-padding
+        prompt_attention = torch.zeros_like(prompt_ids)
+        for i, event in enumerate(events):
+            plen = int(event["prompt_length"])
+            prompt_attention[i, prompt_length - plen:] = 1
+
+        # Response attention: 1 for first response_len tokens, 0 for right-padding
+        response_attention = torch.zeros_like(response_ids)
+        for i, event in enumerate(events):
+            rlen = int(event["response_length"])
+            response_attention[i, :rlen] = 1
+
+        attention_mask = torch.cat([prompt_attention, response_attention], dim=1)
+        response_mask = response_attention.clone()  # long, matching veRL's normal path
+
+        # Position IDs: matches verl's compute_position_id_with_mask()
+        position_ids = torch.clamp(attention_mask.cumsum(dim=1) - 1, min=0)
+
+        # rm_scores: place score at last valid response token
+        resp_length = response_ids.shape[1]
+        rm_scores = torch.zeros(n_events, resp_length)
+        for i, event in enumerate(events):
+            valid_len = int(event["response_length"])
+            if valid_len > 0:
+                rm_scores[i, valid_len - 1] = float(event["score"])
+
+        batch_dict = {
+            "prompts": prompt_ids,
+            "responses": response_ids,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "response_mask": response_mask,
+            "rm_scores": rm_scores,
+        }
+
+        # Assign UIDs: group by prompt text (4 rollouts per prompt share a uid)
+        prompt_to_uid = {}
+        uids = []
+        for event in events:
+            prompt_key = event.get("input", "")
+            if prompt_key not in prompt_to_uid:
+                prompt_to_uid[prompt_key] = str(uuid.uuid4())
+            uids.append(prompt_to_uid[prompt_key])
+
+        # Build non_tensor_batch.
+        # data_source and reward_model are constructed from JSONL events
+        # to avoid ordering mismatches with the dataloader batch.
+        non_tensor_batch = {"uid": np.array(uids, dtype=object)}
+        # data_source is always the same for all events in a run;
+        # get it from the original dataloader batch.
+        ds = original_batch.non_tensor_batch.get("data_source")
+        non_tensor_batch["data_source"] = np.array([ds[0]] * n_events, dtype=object)
+        non_tensor_batch["reward_model"] = np.array(
+            [{"ground_truth": event.get("ground_truth", "")} for event in events],
+            dtype=object)
+        non_tensor_batch["multi_modal_inputs"] = np.array([{}] * n_events, dtype=object)
+
+        from verl import DataProto
+        result = DataProto.from_dict(
+            tensors=batch_dict,
+            non_tensors=non_tensor_batch,
+            meta_info={"reward_extra_keys": [],
+                       "temperature": self.config.actor_rollout_ref.rollout.temperature},
+        )
+
+        print(f"[ABLATION] Reconstructed batch: {n_events} events, "
+              f"{len(prompt_to_uid)} unique prompts", flush=True)
+        return result
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -1027,17 +1135,23 @@ class RayPPOTrainer:
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
 
-        actor_path = os.path.join(global_step_folder, "actor")
-        critic_path = os.path.join(global_step_folder, str(Role.Critic))
-        # load actor
-        self.actor_rollout_wg.load_checkpoint(
-            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
-        )
-        # load critic
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(
-                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+        # Skip model loading if LoRA weights were already loaded via lora_adapter_path
+        # (used for ablation with LoRA-only checkpoints)
+        lora_adapter_path = self.config.actor_rollout_ref.model.get("lora_adapter_path")
+        if lora_adapter_path is not None:
+            print(f"Skipping model checkpoint load (LoRA adapter already loaded from {lora_adapter_path})")
+        else:
+            actor_path = os.path.join(global_step_folder, "actor")
+            critic_path = os.path.join(global_step_folder, str(Role.Critic))
+            # load actor
+            self.actor_rollout_wg.load_checkpoint(
+                actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+            # load critic
+            if self.use_critic:
+                self.critic_wg.load_checkpoint(
+                    critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+                )
 
         # load dataloader,
         # TODO: from remote not implemented yet
@@ -1315,6 +1429,13 @@ class RayPPOTrainer:
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights()
+        # When resuming with lora_adapter_path, the first update_weights() pushes
+        # base model only (base_sync_done=False). We need a second call to push
+        # the LoRA weights so that the rollout engine has the correct model state
+        # for the initial validation.
+        if self.config.actor_rollout_ref.model.get("lora_adapter_path") is not None:
+            self.checkpoint_manager.sleep_replicas()
+            self.checkpoint_manager.update_weights()
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1390,73 +1511,91 @@ class RayPPOTrainer:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                # --- Event ablation: inject cached rollouts for the target step ---
+                # ablation.step is 0-indexed (attribution convention);
+                # self.global_steps is 1-indexed (veRL convention), so compare step+1.
+                ablation_cfg = self.config.trainer.get("ablation", None)
+                _ablation_active = (
+                    ablation_cfg is not None
+                    and ablation_cfg.get("enabled", False)
+                    and self.global_steps == ablation_cfg.get("step") + 1
                 )
+                if _ablation_active:
+                    batch = self._inject_ablation_rollouts(batch, ablation_cfg)
+                    # Free vLLM GPU memory (normally done after generate_sequences)
+                    self.checkpoint_manager.sleep_replicas()
+                    # Skip uid assignment, gen_batch, generation, repeat, balance_batch
+                else:
+                    # add uid to batch
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
 
-                gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                gen_batch = self._get_gen_batch(batch) if not _ablation_active else None
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                if _ablation_active:
+                    # Ablation step: batch already contains the reconstructed rollouts.
+                    # Skip generation, repeat, and balance_batch.
+                    pass
+                else:
+                    # pass global_steps to trace
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
+
                 with marked_timer("step", timing_raw):
-                    # generate a batch
-                    with marked_timer("gen", timing_raw, color="red"):
-                        if curr_step_profile:
-                            self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
-                            self.async_rollout_manager.stop_profile()
-
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
-
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
+                    if not _ablation_active:
+                        # generate a batch
+                        with marked_timer("gen", timing_raw, color="red"):
                             if curr_step_profile:
                                 self.async_rollout_manager.start_profile()
-                            gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                             self.checkpoint_manager.sleep_replicas()
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
-                            batch = batch.union(gen_baseline_output)
-                            # compute reward model score on batch
-                            rm_scores = None
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
-                                batch_reward = self._compute_reward_colocate(batch)
-                                batch = batch.union(batch_reward)
 
-                            # Compute or extract reward for REMAX baseline
-                            reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
 
-                            keys_to_pop = set(gen_baseline_output.batch.keys())
-                            if rm_scores is not None:
-                                keys_to_pop.update(rm_scores.batch.keys())
-                            batch.pop(batch_keys=list(keys_to_pop))
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                            with marked_timer("gen_max", timing_raw, color="purple"):
+                                gen_baseline_batch = deepcopy(gen_batch)
+                                gen_baseline_batch.meta_info["do_sample"] = False
+                                if curr_step_profile:
+                                    self.async_rollout_manager.start_profile()
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                                self.checkpoint_manager.sleep_replicas()
+                                if curr_step_profile:
+                                    self.async_rollout_manager.stop_profile()
+                                batch = batch.union(gen_baseline_output)
+                                # compute reward model score on batch
+                                rm_scores = None
+                                if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                    batch_reward = self._compute_reward_colocate(batch)
+                                    batch = batch.union(batch_reward)
 
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
+                                # Compute or extract reward for REMAX baseline
+                                reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
 
-                            del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                                keys_to_pop = set(gen_baseline_output.batch.keys())
+                                if rm_scores is not None:
+                                    keys_to_pop.update(rm_scores.batch.keys())
+                                batch.pop(batch_keys=list(keys_to_pop))
 
-                    if "response_mask" not in batch.batch.keys():
-                        batch.batch["response_mask"] = compute_response_mask(batch)
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                                batch.batch["reward_baselines"] = reward_baseline_tensor
+
+                                del rm_scores, gen_baseline_batch, gen_baseline_output
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
+
+                        if "response_mask" not in batch.batch.keys():
+                            batch.batch["response_mask"] = compute_response_mask(batch)
+                        # Balance the number of valid tokens across DP ranks.
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1583,6 +1722,42 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                    # --- Event ablation: zero out target event's advantage ---
+                    if _ablation_active:
+                        _aidx = int(ablation_cfg.get("event_idx"))
+                        _noop = int(ablation_cfg.get("noop"))
+                        assert 0 <= _aidx < batch.batch["advantages"].shape[0], \
+                            f"event_idx {_aidx} out of range [0, {batch.batch['advantages'].shape[0]})"
+                        import sys
+                        # Sanity check: print prompt and response at the target event
+                        _prompt_text = self.tokenizer.decode(
+                            batch.batch["prompts"][_aidx], skip_special_tokens=True
+                        )[:200]
+                        _response_text = self.tokenizer.decode(
+                            batch.batch["responses"][_aidx], skip_special_tokens=True
+                        )[:300]
+                        _adv_sum = batch.batch["advantages"][_aidx].sum().item()
+                        _adv_nonzero = (batch.batch["advantages"][_aidx] != 0).sum().item()
+                        _adv_per_token = _adv_sum / max(_adv_nonzero, 1)
+                        _score = batch.batch["rm_scores"][_aidx].sum().item()
+                        if _noop:
+                            print(f"[ABLATION NOOP] Keeping advantages for event idx {_aidx} "
+                                  f"at step {ablation_cfg.get('step')} "
+                                  f"(global_steps={self.global_steps})\n"
+                                  f"  Prompt (first 200 chars): {_prompt_text}\n"
+                                  f"  Response (first 300 chars): {_response_text}\n"
+                                  f"  Score: {_score:.4f}, Advantage (per-token): {_adv_per_token:.6f} (sum: {_adv_sum:.2f}, tokens: {_adv_nonzero})",
+                                  file=sys.stderr, flush=True)
+                        else:
+                            print(f"[ABLATION] Zeroing advantages for event idx {_aidx} "
+                                  f"at step {ablation_cfg.get('step')} "
+                                  f"(global_steps={self.global_steps})\n"
+                                  f"  Prompt (first 200 chars): {_prompt_text}\n"
+                                  f"  Response (first 300 chars): {_response_text}\n"
+                                  f"  Score: {_score:.4f}, Advantage before zeroing (per-token): {_adv_per_token:.6f} (sum: {_adv_sum:.2f}, tokens: {_adv_nonzero})",
+                                  file=sys.stderr, flush=True)
+                            batch.batch["advantages"][_aidx] = 0.0
 
                     # update critic
                     if self.use_critic:
