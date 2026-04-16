@@ -76,6 +76,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -406,6 +407,26 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
+        # Think-then-constrain: register the V1 logits processor plugin
+        allowed_token_ids = self.config.get("allowed_token_ids")
+        constrained_with_thinking = self.config.get("constrained_with_thinking", False)
+        if allowed_token_ids and constrained_with_thinking:
+            think_end_id = self.config.get("think_end_token_id")
+            post_think_id = self.config.get("post_think_token_id")
+            assert think_end_id is not None and post_think_id is not None, (
+                "constrained_with_thinking requires think_end_token_id and "
+                "post_think_token_id to be set in the rollout config"
+            )
+            # Pass config to the processor via environment variables
+            os.environ["THINK_CONSTRAIN_ALLOWED_TOKEN_IDS"] = ",".join(
+                str(int(t)) for t in allowed_token_ids
+            )
+            os.environ["THINK_CONSTRAIN_THINK_END_ID"] = str(int(think_end_id))
+            os.environ["THINK_CONSTRAIN_POST_THINK_ID"] = str(int(post_think_id))
+            args["logits-processors"] = [
+                "attri_bench.think_constrain_logits_processor:ThinkThenConstrainProcessor"
+            ]
+
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
         if self.replica_rank == 0:
@@ -537,6 +558,18 @@ class vLLMHttpServer:
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
+        # Constrained decoding
+        allowed_token_ids = self.config.get("allowed_token_ids")
+        constrained_with_thinking = self.config.get("constrained_with_thinking", False)
+        if allowed_token_ids and constrained_with_thinking:
+            # Think-then-constrain: handled by the V1 logits processor plugin
+            # registered at engine init (ThinkThenConstrainProcessor).
+            # Do NOT set allowed_token_ids on SamplingParams — the plugin
+            # handles dynamic per-position constraining.
+            pass
+        elif allowed_token_ids:
+            # Static constraint: restrict ALL tokens to allowed set
+            sampling_params["allowed_token_ids"] = list(allowed_token_ids)
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}

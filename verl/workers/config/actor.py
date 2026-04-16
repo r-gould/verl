@@ -301,6 +301,18 @@ class FSDPActorConfig(ActorConfig):
     sum_pi_squared_checkpointing: bool = False
     qat: QATConfig = field(default_factory=QATConfig)
     grad_projection_path: str | None = None
+    # Constrained decoding: list of token IDs to allow during training-time
+    # log-prob computation. Logits for all other tokens are set to -inf before
+    # softmax, so log π(token) is normalized over the allowed set only.
+    # None disables this (default behavior).
+    allowed_token_ids: list[int] | None = None
+
+    # Think-then-constrain mode: when True, apply the allowed_token_ids logit
+    # restriction only at the answer token position (after </think>\n\n) rather
+    # than at every response position. This lets think tokens have unconstrained
+    # log-probs while the answer token's log-prob is normalized over {A,B,C,D}.
+    constrained_with_thinking: bool = False
+    think_end_token_id: int | None = None  # </think> token ID, resolved in train.sh
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

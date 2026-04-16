@@ -260,6 +260,36 @@ class DataParallelPPOActor(BasePPOActor):
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
 
+                    # Constrained decoding: mask logits to allowed token IDs
+                    _allowed_ids = getattr(self.config, 'allowed_token_ids', None)
+                    _cwt = getattr(self.config, 'constrained_with_thinking', False)
+                    if _allowed_ids and _cwt:
+                        # Per-position masking: only mask the answer token
+                        # (after </think>\n\n), leave think tokens unconstrained.
+                        # In rmpad mode, logits_rmpad[t] predicts
+                        # input_ids_rmpad[t+1]. The answer is at
+                        # input_ids[think_pos+2], so we mask logits_rmpad[think_pos+1].
+                        # (The padded path in the same file uses +2 because its
+                        # indexing is in the responses space, which is already
+                        # offset by 1 relative to input_ids.)
+                        _think_end_id = getattr(self.config, 'think_end_token_id', 151668)
+                        _ids_flat = input_ids_rmpad.squeeze(0)  # (total_nnz,)
+                        _think_pos = (_ids_flat == _think_end_id).nonzero(as_tuple=True)[0]
+                        _answer_pos = _think_pos + 1
+                        _answer_pos = _answer_pos[_answer_pos < logits_rmpad.shape[0]]
+                        if len(_answer_pos) > 0:
+                            _mask = torch.full(
+                                (len(_answer_pos), logits_rmpad.shape[1]),
+                                float('-inf'), device=logits_rmpad.device,
+                                dtype=logits_rmpad.dtype,
+                            )
+                            _mask[:, _allowed_ids] = 0.0
+                            logits_rmpad[_answer_pos] = logits_rmpad[_answer_pos] + _mask
+                    elif _allowed_ids:
+                        _mask = torch.full_like(logits_rmpad, float('-inf'))
+                        _mask[:, _allowed_ids] = 0.0
+                        logits_rmpad = logits_rmpad + _mask
+
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
@@ -369,6 +399,32 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+
+                    # Constrained decoding: mask logits to allowed token IDs
+                    _allowed_ids = getattr(self.config, 'allowed_token_ids', None)
+                    _cwt = getattr(self.config, 'constrained_with_thinking', False)
+                    if _allowed_ids and _cwt:
+                        # Per-position masking: only mask the answer token
+                        # (after </think>\n\n), leave think tokens unconstrained.
+                        _think_end_id = getattr(self.config, 'think_end_token_id', 151668)
+                        _responses = micro_batch["responses"]  # (bsz, response_length)
+                        for _b in range(_responses.shape[0]):
+                            _think_pos = (_responses[_b] == _think_end_id).nonzero(as_tuple=True)[0]
+                            if len(_think_pos) > 0:
+                                _ans_pos = _think_pos[-1].item() + 2  # skip \n\n
+                                if _ans_pos < logits.shape[1]:
+                                    _m = torch.full(
+                                        (logits.shape[2],), float('-inf'),
+                                        device=logits.device,
+                                        dtype=logits.dtype,
+                                    )
+                                    _m[_allowed_ids] = 0.0
+                                    logits[_b, _ans_pos] = logits[_b, _ans_pos] + _m
+                    elif _allowed_ids:
+                        _mask = torch.full_like(logits, float('-inf'))
+                        _mask[:, :, _allowed_ids] = 0.0
+                        logits = logits + _mask
+
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:

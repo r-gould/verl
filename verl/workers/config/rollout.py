@@ -244,6 +244,21 @@ class RolloutConfig(BaseConfig):
 
     qat: Optional[dict] = None
 
+    # Constrained decoding: list of token IDs to allow during generation.
+    # When set, vLLM SamplingParams.allowed_token_ids restricts the output
+    # vocabulary to these IDs. None disables constraint (default).
+    allowed_token_ids: Optional[list] = None
+
+    # Think-then-constrain mode: allow free generation during <think>...</think>,
+    # then constrain the answer token to allowed_token_ids after </think>.
+    # Requires allowed_token_ids to be set. Uses a logits processor instead of
+    # the static allowed_token_ids constraint.
+    constrained_with_thinking: bool = False
+    # Token IDs for the think-then-constrain processor (resolved from tokenizer
+    # in train.sh and passed as config). Only used when constrained_with_thinking=True.
+    think_end_token_id: Optional[int] = None    # </think>
+    post_think_token_id: Optional[int] = None   # \n\n
+
     def __post_init__(self):
         """Validate the rollout config"""
         # Deprecation warning for mode field - only async mode is supported
